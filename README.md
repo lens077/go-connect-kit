@@ -22,18 +22,24 @@
 |---|---|---|
 | `env` | 环境变量读取与类型转换 | 无（仅标准库） |
 | `meta` | 应用身份（`AppInfo`）与构建版本（`Version`） | 无（仅标准库） |
+| `config` | 严格解码、Protovalidate 校验、原子替换、订阅与最后已知正常值 | protobuf、Viper、Fx |
+| `configschema` | 用生成的 JSON Schema 校验 YAML，并只返回脱敏错误路径 | JSON Schema、YAML |
+| `log` | Zap 构造、Fx 事件日志与应用日志级别热更新 | Zap、OTel bridge、`config.Live` |
+| `otel` | trace、metric、log 管道，资源、传播、运行时与数据库/Redis 埋点辅助 | OpenTelemetry |
+| `registry` | Consul 注册、TTL 心跳、可选 gRPC 就绪检查与故障自恢复 | Consul API、Fx |
 | `dbutil` | pgx / PostgreSQL 错误识别、业务错误映射与可选日志回调 | `pgx/v5`、`lib/pq/pqerror` |
 
-`env` 与 `meta` 用于验证首条发布链路。`dbutil` 随后从 ecommerce 已统一的实现迁入；它是
-PostgreSQL 专用 adapter，不声称提供可替换的数据库能力接缝。ecommerce、control-tower 与模板
-均通过同一个公共接口消费，错误映射只维护一份。
+这些包只接收提供方无关的 Go `Options`，不导入消费方的 protobuf。消费方保留很薄的
+protobuf-to-options adapter；配置源的具体实现也由消费方适配 `config.Source` / `config.Watcher`。
+删除本模块后，加载、热更新、日志、遥测、注册恢复和数据库错误映射会重新散回所有调用方，
+因此共享实现只在这里维护一份。
 
-其余模块（`config`、`log`、`otel`、`registry`）仍需先拆除对具体 protobuf 配置类型的依赖。
+BSR 不参与这条发布链路：BSR 分发 proto，不分发 Go 实现。本模块作为普通 Go module 发布。
 
 ## 版本约束
 
 `go.mod` 的 go directive 是**天花板**：必须小于等于所有消费方里最低的那个版本。
-当前消费方为 ecommerce（go 1.27.0）与 control-tower（go 1.26.5），因此本模块声明 `go 1.26.0`。
+当前消费方为 ecommerce（go 1.27.0）、control-tower 与模板（均为 go 1.26.5），因此本模块声明 `go 1.26.0`。
 
 抬高它之前先确认所有消费方都已升级——否则低版本那一侧编译不过，且报错发生在别人的仓库里。
 
