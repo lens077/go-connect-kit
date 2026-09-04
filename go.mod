@@ -8,3 +8,14 @@ module github.com/lens077/go-connect-kit
 //
 // 想抬高它之前，先确认所有消费方都已经升上去。
 go 1.26.0
+
+require (
+	github.com/jackc/pgx/v5 v5.10.0
+	github.com/lib/pq v1.12.3
+)
+
+require (
+	github.com/jackc/pgpassfile v1.0.0 // indirect
+	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
+	golang.org/x/text v0.29.0 // indirect
+)

@@ -22,12 +22,13 @@
 |---|---|---|
 | `env` | 环境变量读取与类型转换 | 无（仅标准库） |
 | `meta` | 应用身份（`AppInfo`）与构建版本（`Version`） | 无（仅标准库） |
+| `dbutil` | pgx / PostgreSQL 错误识别、业务错误映射与可选日志回调 | `pgx/v5`、`lib/pq/pqerror` |
 
-首批只放这两个模块：它们在 ecommerce 的 10 个服务与 control-tower 之间**逐字节相同**，
-不需要任何接口设计，因此适合用来验证发布链路本身是否走得通。
+`env` 与 `meta` 用于验证首条发布链路。`dbutil` 随后从 ecommerce 已统一的实现迁入；它是
+PostgreSQL 专用 adapter，不声称提供可替换的数据库能力接缝。ecommerce、control-tower 与模板
+均通过同一个公共接口消费，错误映射只维护一份。
 
-其余模块（`config`、`log`、`otel`、`registry`、`dbutil`）需要先把对具体 protobuf 配置
-类型的依赖拆掉才能搬，不在首批。
+其余模块（`config`、`log`、`otel`、`registry`）仍需先拆除对具体 protobuf 配置类型的依赖。
 
 ## 版本约束
 
