@@ -26,6 +26,7 @@ const (
 	defaultCheckInterval   = 10 * time.Second
 	defaultCheckTimeout    = 12 * time.Second
 	defaultRequestTimeout  = 15 * time.Second
+	defaultDeregisterAfter = time.Minute
 	defaultRetryBase       = time.Second
 	defaultRetryMax        = 30 * time.Second
 	consulScheme           = "http"
@@ -66,7 +67,7 @@ type GRPCCheckOptions struct {
 type CheckOptions struct {
 	TTL  TTLCheckOptions
 	GRPC *GRPCCheckOptions
-	// DeregisterCriticalServiceAfter is required so an unowned TTL registration expires.
+	// DeregisterCriticalServiceAfter defaults to one minute so an unowned TTL registration expires.
 	DeregisterCriticalServiceAfter string
 }
 
@@ -91,7 +92,7 @@ type ConsulRegistry struct {
 	lifecycleMu       sync.Mutex
 	cancelMaintain    context.CancelFunc
 	maintainDone      <-chan struct{}
-	deregisterMu      sync.Mutex
+	deregisterGate    chan struct{}
 	registerAttempted atomic.Bool
 	registered        atomic.Bool
 	retryBase         time.Duration
@@ -138,6 +139,11 @@ var Module = fx.Module("registry",
 		if options.Address == "" {
 			return nil, fmt.Errorf("%w: consul address is empty", ErrInvalidOptions)
 		}
+		normalized, _, err := validateAndNormalizeOptions(options)
+		if err != nil {
+			return nil, err
+		}
+		options = normalized
 
 		clientOptions := []Option{WithLogger(logger)}
 		if options.TLS.Enabled {
@@ -202,14 +208,46 @@ func NewConsulRegistry(address, id, name string, opts ...Option) (*ConsulRegistr
 	}
 	config.HttpClient.Timeout = defaultRequestTimeout
 	return &ConsulRegistry{
-		Addr:      address,
-		ID:        id,
-		Name:      name,
-		client:    client,
-		logger:    options.logger,
-		retryBase: defaultRetryBase,
-		retryMax:  defaultRetryMax,
+		Addr:           address,
+		ID:             id,
+		Name:           name,
+		client:         client,
+		logger:         options.logger,
+		deregisterGate: make(chan struct{}, 1),
+		retryBase:      defaultRetryBase,
+		retryMax:       defaultRetryMax,
 	}, nil
+}
+
+func validateAndNormalizeOptions(options Options) (Options, int, error) {
+	_, portText, err := net.SplitHostPort(options.ServerAddress)
+	if err != nil {
+		return options, 0, fmt.Errorf("%w: server address: %v", ErrInvalidOptions, err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return options, 0, fmt.Errorf("%w: invalid server port %q", ErrInvalidOptions, portText)
+	}
+	if !options.Check.TTL.Enabled {
+		return options, 0, fmt.Errorf("%w: consul TTL check is missing", ErrInvalidOptions)
+	}
+	ttlDuration, err := time.ParseDuration(options.Check.TTL.Duration)
+	if err != nil || ttlDuration <= 0 {
+		return options, 0, fmt.Errorf("%w: invalid consul TTL duration %q", ErrInvalidOptions, options.Check.TTL.Duration)
+	}
+	pingInterval := ttlPingInterval(options.Check.TTL)
+	if pingInterval >= ttlDuration {
+		return options, 0, fmt.Errorf("%w: consul TTL ping interval %s must be shorter than TTL %s", ErrInvalidOptions, pingInterval, ttlDuration)
+	}
+
+	if options.Check.DeregisterCriticalServiceAfter == "" {
+		options.Check.DeregisterCriticalServiceAfter = defaultDeregisterAfter.String()
+	}
+	deregisterAfter := options.Check.DeregisterCriticalServiceAfter
+	if duration, err := time.ParseDuration(deregisterAfter); err != nil || duration <= 0 {
+		return options, 0, fmt.Errorf("%w: invalid deregistration delay %q", ErrInvalidOptions, deregisterAfter)
+	}
+	return options, port, nil
 }
 
 // Register installs the TTL liveness lease and optional gRPC readiness check.
@@ -224,29 +262,11 @@ func (r *ConsulRegistry) RegisterContext(ctx context.Context, options Options, i
 	}
 	r.logger.Debug("registering service to Consul", zap.String("id", r.ID))
 
-	_, portText, err := net.SplitHostPort(options.ServerAddress)
+	normalized, port, err := validateAndNormalizeOptions(options)
 	if err != nil {
-		return fmt.Errorf("%w: server address: %v", ErrInvalidOptions, err)
+		return err
 	}
-	port, err := strconv.Atoi(portText)
-	if err != nil || port < 1 || port > 65535 {
-		return fmt.Errorf("%w: invalid server port %q", ErrInvalidOptions, portText)
-	}
-	if !options.Check.TTL.Enabled {
-		return fmt.Errorf("%w: consul TTL check is missing", ErrInvalidOptions)
-	}
-	ttlDuration, err := time.ParseDuration(options.Check.TTL.Duration)
-	if err != nil || ttlDuration <= 0 {
-		return fmt.Errorf("%w: invalid consul TTL duration %q", ErrInvalidOptions, options.Check.TTL.Duration)
-	}
-	pingInterval := ttlPingInterval(options.Check.TTL)
-	if pingInterval >= ttlDuration {
-		return fmt.Errorf("%w: consul TTL ping interval %s must be shorter than TTL %s", ErrInvalidOptions, pingInterval, ttlDuration)
-	}
-	deregisterAfter := options.Check.DeregisterCriticalServiceAfter
-	if duration, err := time.ParseDuration(deregisterAfter); err != nil || duration <= 0 {
-		return fmt.Errorf("%w: invalid deregistration delay %q", ErrInvalidOptions, deregisterAfter)
-	}
+	options = normalized
 
 	registration := &api.AgentServiceRegistration{
 		ID:      r.ID,
@@ -441,8 +461,18 @@ func (r *ConsulRegistry) Deregister() error {
 }
 
 func (r *ConsulRegistry) deregisterContext(ctx context.Context) error {
-	r.deregisterMu.Lock()
-	defer r.deregisterMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case r.deregisterGate <- struct{}{}:
+		defer func() { <-r.deregisterGate }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if !r.registerAttempted.Load() && !r.registered.Load() {
 		r.logger.Info("skipping Consul deregistration; never attempted", zap.String("id", r.ID))
 		return nil

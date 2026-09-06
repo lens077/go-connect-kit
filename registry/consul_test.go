@@ -263,6 +263,21 @@ func TestModuleRejectsEnabledRegistryWithoutAddress(t *testing.T) {
 	require.ErrorIs(t, app.Err(), ErrInvalidOptions)
 }
 
+func TestModuleRejectsInvalidRegistrationOptionsBeforeStart(t *testing.T) {
+	agent := startFakeConsulAgent(t)
+	options := testOptions("0.0.0.0:30006", 0)
+	options.Address = agent.address
+	options.Check.TTL.Duration = "5s"
+
+	app := fx.New(
+		fx.NopLogger,
+		fx.Supply(options, testAppInfo, zaptest.NewLogger(t)),
+		Module,
+	)
+	require.ErrorIs(t, app.Err(), ErrInvalidOptions)
+	assert.Zero(t, agent.RegisterCalls())
+}
+
 func TestRegisterUsesProviderNeutralOptions(t *testing.T) {
 	agent := startFakeConsulAgent(t)
 	registry := newRegistry(t, agent.address)
@@ -301,6 +316,19 @@ func TestRegisterAllowsTTLOnly(t *testing.T) {
 	assert.Empty(t, registration.Checks)
 }
 
+func TestRegisterDefaultsDeregistrationDelay(t *testing.T) {
+	agent := startFakeConsulAgent(t)
+	registry := newRegistry(t, agent.address)
+	options := testOptions("0.0.0.0:30010", time.Second)
+	options.Check.DeregisterCriticalServiceAfter = ""
+
+	require.NoError(t, registry.Register(options, testAppInfo))
+	registration := agent.Registered()
+	require.NotNil(t, registration)
+	require.NotNil(t, registration.Check)
+	assert.Equal(t, defaultDeregisterAfter.String(), registration.Check.DeregisterCriticalServiceAfter)
+}
+
 func TestRegisterRejectsInvalidServerAndMissingTTL(t *testing.T) {
 	agent := startFakeConsulAgent(t)
 	registry := newRegistry(t, agent.address)
@@ -320,10 +348,6 @@ func TestRegisterRejectsInvalidServerAndMissingTTL(t *testing.T) {
 
 	options = testOptions("0.0.0.0:30006", time.Second)
 	options.Check.DeregisterCriticalServiceAfter = "-1s"
-	require.ErrorIs(t, registry.Register(options, testAppInfo), ErrInvalidOptions)
-
-	options = testOptions("0.0.0.0:30006", time.Second)
-	options.Check.DeregisterCriticalServiceAfter = ""
 	require.ErrorIs(t, registry.Register(options, testAppInfo), ErrInvalidOptions)
 
 	options = testOptions("0.0.0.0:30006", 0)
@@ -583,6 +607,44 @@ func TestMaintainDoesNotRetryInvalidOptions(t *testing.T) {
 		t.Fatal("Maintain must return on invalid options instead of retrying")
 	}
 	assert.Equal(t, 0, agent.RegisterCalls())
+}
+
+func TestConcurrentShutdownHonorsContextWhileDeregistering(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	released := false
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if !strings.HasPrefix(request.URL.Path, "/v1/agent/service/deregister/") {
+			writer.WriteHeader(http.StatusNotFound)
+			return
+		}
+		close(started)
+		<-release
+	}))
+	defer server.Close()
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
+
+	registry := newRegistry(t, strings.TrimPrefix(server.URL, "http://"))
+	registry.registerAttempted.Store(true)
+	firstErr := make(chan error, 1)
+	go func() { firstErr <- registry.Shutdown(context.Background()) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first deregistration request did not start")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	require.ErrorIs(t, registry.Shutdown(ctx), context.DeadlineExceeded)
+
+	close(release)
+	released = true
+	require.NoError(t, <-firstErr)
 }
 
 // A process that never reached Consul must not fail its own shutdown trying to
