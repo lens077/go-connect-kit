@@ -24,7 +24,7 @@ type LoadOptions struct {
 // SourceFactory builds the repository-owned Source adapter used by an Fx application.
 type SourceFactory func() (Source, error)
 
-// RestartRequiredSection identifies a configuration section that is applied only on restart.
+// RestartRequiredSection identifies a section whose dependent resources are not reconfigured live.
 type RestartRequiredSection struct {
 	Name    string
 	Message proto.Message

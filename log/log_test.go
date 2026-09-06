@@ -13,6 +13,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
@@ -87,6 +89,23 @@ func TestNewLoggerFiltersLevels(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTeeCoresFiltersOTelSinkAndHotReloads(t *testing.T) {
+	observedCore, observed := observer.New(zapcore.DebugLevel)
+	level := zap.NewAtomicLevelAt(zapcore.WarnLevel)
+	logger := zap.New(teeCores(zapcore.NewNopCore(), observedCore, level))
+
+	logger.Debug("before-debug")
+	logger.Info("before-info")
+	logger.Warn("before-warn")
+	require.Equal(t, 1, observed.Len())
+	assert.Equal(t, "before-warn", observed.AllUntimed()[0].Message)
+
+	level.SetLevel(zapcore.DebugLevel)
+	logger.Debug("after-debug")
+	require.Equal(t, 2, observed.Len())
+	assert.Equal(t, "after-debug", observed.AllUntimed()[1].Message)
 }
 
 func TestNewLoggerInvalidLevelFallsBackToDebug(t *testing.T) {

@@ -71,11 +71,46 @@ type Options struct {
 	RuntimeMetrics   bool
 }
 
-// Module provides the unified OpenTelemetry shutdown function.
+type sdkLifecycle struct {
+	mu       sync.RWMutex
+	shutdown func(context.Context) error
+}
+
+func (sdk *sdkLifecycle) setShutdown(shutdown func(context.Context) error) {
+	sdk.mu.Lock()
+	sdk.shutdown = shutdown
+	sdk.mu.Unlock()
+}
+
+func (sdk *sdkLifecycle) stop(ctx context.Context) error {
+	sdk.mu.RLock()
+	shutdown := sdk.shutdown
+	sdk.mu.RUnlock()
+	if shutdown == nil {
+		return nil
+	}
+	return shutdown(ctx)
+}
+
+// Module eagerly registers lifecycle hooks, initializes OpenTelemetry on start,
+// and provides the idempotent shutdown function for explicit flush points.
 var Module = fx.Module("otel",
-	fx.Provide(func(info meta.AppInfo, options Options, logger *zap.Logger) (func(context.Context) error, error) {
-		return SetupOTelSDK(context.Background(), info, options, logger)
+	fx.Provide(func(lc fx.Lifecycle, info meta.AppInfo, options Options, logger *zap.Logger) func(context.Context) error {
+		sdk := &sdkLifecycle{}
+		lc.Append(fx.Hook{
+			OnStart: func(ctx context.Context) error {
+				shutdown, err := SetupOTelSDK(ctx, info, options, logger)
+				if err != nil {
+					return err
+				}
+				sdk.setShutdown(shutdown)
+				return nil
+			},
+			OnStop: sdk.stop,
+		})
+		return sdk.stop
 	}),
+	fx.Invoke(func(_ func(context.Context) error) {}),
 )
 
 // SetupOTelSDK initializes the configured trace, metric, and log export pipelines.
@@ -102,9 +137,9 @@ func SetupOTelSDK(ctx context.Context, info meta.AppInfo, options Options, logge
 		return err
 	}
 
-	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
-		logger.Error("opentelemetry sdk error", zap.Error(err))
-	}))
+	// Keep SDK-internal failures on OpenTelemetry's stderr handler. Sending an
+	// exporter failure through the bridged application logger feeds it back into
+	// the same failing OTLP log pipeline.
 	otel.SetTextMapPropagator(newPropagator())
 
 	res, err := newResource(info, options.ServiceNamespace)

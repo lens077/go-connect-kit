@@ -84,6 +84,30 @@ func parseLevel(value string) zapcore.Level {
 	return level
 }
 
+type atomicLevelCore struct {
+	zapcore.Core
+	level zap.AtomicLevel
+}
+
+func (core atomicLevelCore) Enabled(level zapcore.Level) bool {
+	return core.level.Enabled(level) && core.Core.Enabled(level)
+}
+
+func (core atomicLevelCore) With(fields []zapcore.Field) zapcore.Core {
+	return atomicLevelCore{Core: core.Core.With(fields), level: core.level}
+}
+
+func (core atomicLevelCore) Check(entry zapcore.Entry, checked *zapcore.CheckedEntry) *zapcore.CheckedEntry {
+	if !core.level.Enabled(entry.Level) {
+		return checked
+	}
+	return core.Core.Check(entry, checked)
+}
+
+func teeCores(stdoutCore, otelCore zapcore.Core, level zap.AtomicLevel) zapcore.Core {
+	return zapcore.NewTee(stdoutCore, atomicLevelCore{Core: otelCore, level: level})
+}
+
 func newLogger(options Options, info meta.AppInfo) (*zap.Logger, zap.AtomicLevel) {
 	level := zap.NewAtomicLevelAt(parseLevel(options.Level))
 
@@ -108,5 +132,5 @@ func newLogger(options Options, info meta.AppInfo) (*zap.Logger, zap.AtomicLevel
 	if options.StacktraceLevel != "" {
 		zapOptions = append(zapOptions, zap.AddStacktrace(parseLevel(options.StacktraceLevel)))
 	}
-	return zap.New(zapcore.NewTee(stdoutCore, otelCore), zapOptions...), level
+	return zap.New(teeCores(stdoutCore, otelCore, level), zapOptions...), level
 }

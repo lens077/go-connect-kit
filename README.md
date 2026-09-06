@@ -22,15 +22,16 @@
 |---|---|---|
 | `env` | 环境变量读取与类型转换 | 无（仅标准库） |
 | `meta` | 应用身份（`AppInfo`）与构建版本（`Version`） | 无（仅标准库） |
-| `config` | 严格解码、Protovalidate 校验、原子替换、订阅与最后已知正常值 | protobuf、Viper、Fx |
+| `config` | 默认严格解码、Protovalidate 校验、原子替换、订阅与最后已知正常值 | protobuf、Viper、Fx |
 | `configschema` | 用生成的 JSON Schema 校验 YAML，并只返回脱敏错误路径 | JSON Schema、YAML |
-| `log` | Zap 构造、Fx 事件日志与应用日志级别热更新 | Zap、OTel bridge、`config.Live` |
-| `otel` | trace、metric、log 管道，资源、传播、运行时与数据库/Redis 埋点辅助 | OpenTelemetry |
-| `registry` | Consul 注册、TTL 心跳、可选 gRPC 就绪检查与故障自恢复 | Consul API、Fx |
+| `log` | Zap 构造、Fx 事件日志，以及 stdout/OTel 一致的应用日志级别热更新 | Zap、OTel bridge、`config.Live` |
+| `otel` | trace、metric、log 管道，资源、传播、Fx 生命周期与数据库/Redis 埋点辅助 | OpenTelemetry |
+| `registry` | Consul 注册、TTL 心跳、可选 gRPC 就绪检查、Fx 生命周期与故障自恢复 | Consul API、Fx |
 | `dbutil` | pgx / PostgreSQL 错误识别、业务错误映射与可选日志回调 | `pgx/v5`、`lib/pq/pqerror` |
 
 这些包只接收提供方无关的 Go `Options`，不导入消费方的 protobuf。消费方保留很薄的
 protobuf-to-options adapter；配置源的具体实现也由消费方适配 `config.Source` / `config.Watcher`。
+部署环境变量如何映射到 `Options` 也属于消费方策略；kit 不读取 `CONSUL_ENABLED` 等仓库约定。
 删除本模块后，加载、热更新、日志、遥测、注册恢复和数据库错误映射会重新散回所有调用方，
 因此共享实现只在这里维护一份。
 

@@ -2,14 +2,24 @@ package otel
 
 import (
 	"context"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/lens077/go-connect-kit/meta"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	apiotel "go.opentelemetry.io/otel"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 var testAppInfo = meta.AppInfo{
@@ -31,6 +41,76 @@ func TestModuleProvidesShutdown(t *testing.T) {
 	require.NoError(t, app.Err())
 	require.NotNil(t, shutdown)
 	assert.NoError(t, shutdown(context.Background()))
+}
+
+func TestModuleInitializesWithoutOutputConsumer(t *testing.T) {
+	core, observed := observer.New(zapcore.DebugLevel)
+	app := fx.New(
+		fx.NopLogger,
+		fx.Supply(testAppInfo, Options{}, zap.New(core)),
+		Module,
+	)
+	require.NoError(t, app.Err())
+	assert.Zero(t, observed.Len(), "pipeline setup must wait for lifecycle start")
+
+	require.NoError(t, app.Start(context.Background()))
+	assert.Equal(t, 1, observed.FilterMessage("observability is disabled, skipping OpenTelemetry setup").Len())
+	require.NoError(t, app.Stop(context.Background()))
+}
+
+func TestModuleDoesNotInitializeWhenFxNewFails(t *testing.T) {
+	before := sdktrace.NewTracerProvider()
+	apiotel.SetTracerProvider(before)
+
+	sentinel := errors.New("later invoke failed")
+	ratio := 1.0
+	app := fx.New(
+		fx.NopLogger,
+		fx.Supply(testAppInfo, Options{
+			Trace: &TraceOptions{Endpoint: "127.0.0.1:1", SampleRatio: &ratio},
+		}, zap.NewNop()),
+		Module,
+		fx.Invoke(func() error { return sentinel }),
+	)
+	require.ErrorIs(t, app.Err(), sentinel)
+	assert.Equal(t, before, apiotel.GetTracerProvider(), "Fx construction failure must not start SDK workers or replace globals")
+}
+
+func TestModuleFlushesEnabledTracePipelineOnStop(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/traces" {
+			writer.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = io.Copy(io.Discard, request.Body)
+		requests.Add(1)
+		writer.Header().Set("Content-Type", "application/x-protobuf")
+		writer.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	t.Cleanup(func() { apiotel.SetTracerProvider(sdktrace.NewTracerProvider()) })
+
+	ratio := 1.0
+	app := fx.New(
+		fx.NopLogger,
+		fx.Supply(testAppInfo, Options{
+			Trace: &TraceOptions{
+				Endpoint:    strings.TrimPrefix(server.URL, "http://"),
+				SampleRatio: &ratio,
+			},
+		}, zap.NewNop()),
+		Module,
+	)
+	require.NoError(t, app.Err())
+	require.NoError(t, app.Start(context.Background()))
+
+	_, span := apiotel.Tracer("module-lifecycle-test").Start(context.Background(), "flush-on-stop")
+	span.End()
+	stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, app.Stop(stopCtx))
+	assert.GreaterOrEqual(t, requests.Load(), int32(1))
 }
 
 func TestNewResource(t *testing.T) {
@@ -124,12 +204,10 @@ func TestSetupOTelSDKMinimalConfigDoesNotPanic(t *testing.T) {
 		},
 		Logging: &LoggingOptions{Endpoint: "localhost:4318"},
 	}
-	assert.NotPanics(t, func() {
-		shutdown, _ := SetupOTelSDK(context.Background(), testAppInfo, options, zap.NewNop())
-		if shutdown != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-			defer cancel()
-			_ = shutdown(ctx)
-		}
-	})
+	shutdown, err := SetupOTelSDK(context.Background(), testAppInfo, options, zap.NewNop())
+	require.NoError(t, err)
+	require.NotNil(t, shutdown)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_ = shutdown(ctx)
 }

@@ -44,12 +44,12 @@ func NewLive[T proto.Message](initial T) *Live[T] {
 	return live
 }
 
-// Get returns the current read-only configuration pointer.
+// Get returns the current snapshot pointer. Callers must treat it as immutable.
 func (l *Live[T]) Get() T {
 	return l.ptr.Load().value
 }
 
-// Set replaces the current configuration and synchronously notifies subscribers.
+// Set publishes an already decoded and validated snapshot, then synchronously notifies subscribers.
 func (l *Live[T]) Set(cur T) {
 	if isNil(cur) {
 		return

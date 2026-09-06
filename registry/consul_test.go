@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -56,8 +57,9 @@ type fakeConsulAgent struct {
 	// rejectRegistrations makes the next N register calls answer 503,
 	// simulating a Consul that is up but not yet serving (leader election,
 	// CNI policy not programmed) — the failure mode seen on cluster reboot.
-	rejectRegistrations int
-	registerCalls       int
+	rejectRegistrations   int
+	registerCalls         int
+	replaceExistingChecks bool
 }
 
 func (agent *fakeConsulAgent) Registered() *api.AgentServiceRegistration {
@@ -70,6 +72,12 @@ func (agent *fakeConsulAgent) RegisterCalls() int {
 	agent.mu.Lock()
 	defer agent.mu.Unlock()
 	return agent.registerCalls
+}
+
+func (agent *fakeConsulAgent) ReplaceExistingChecks() bool {
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	return agent.replaceExistingChecks
 }
 
 // Forget simulates a Consul restart that lost agent-local registrations:
@@ -101,6 +109,7 @@ func startFakeConsulAgent(t *testing.T) *fakeConsulAgent {
 		case request.URL.Path == "/v1/agent/service/register":
 			agent.mu.Lock()
 			agent.registerCalls++
+			agent.replaceExistingChecks = request.URL.Query().Get("replace-existing-checks") == "true"
 			reject := agent.rejectRegistrations > 0
 			if reject {
 				agent.rejectRegistrations--
@@ -215,43 +224,43 @@ func TestModuleOwnsRegistrationLifecycle(t *testing.T) {
 	assert.Equal(t, []string{testAppInfo.ID}, agent.Deregistered())
 }
 
-func TestModuleCanDisableRegistry(t *testing.T) {
-	tests := []struct {
-		name    string
-		options Options
-	}{
-		{name: "options disabled", options: Options{}},
-		{name: "empty address", options: testOptions("0.0.0.0:30006", time.Second)},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			var registry *ConsulRegistry
-			app := fxtest.New(t,
-				fx.NopLogger,
-				fx.Supply(test.options, testAppInfo, zaptest.NewLogger(t)),
-				Module,
-				fx.Populate(&registry),
-			)
-			require.NoError(t, app.Err())
-			assert.Nil(t, registry)
-			app.RequireStart()
-			app.RequireStop()
-		})
-	}
+func TestModuleStartsWithoutOutputConsumer(t *testing.T) {
+	agent := startFakeConsulAgent(t)
+	options := testOptions("0.0.0.0:30006", 5*time.Millisecond)
+	options.Address = agent.address
+
+	app := fxtest.New(t,
+		fx.NopLogger,
+		fx.Supply(options, testAppInfo, zaptest.NewLogger(t)),
+		Module,
+	)
+	app.RequireStart()
+	require.Eventually(t, func() bool { return agent.Registered() != nil }, time.Second, 5*time.Millisecond)
+	app.RequireStop()
 }
 
-func TestModuleHonorsConsulEnabledFalse(t *testing.T) {
-	agent := startFakeConsulAgent(t)
-	options := testOptions("0.0.0.0:30006", time.Millisecond)
-	options.Address = agent.address
-	t.Setenv(EnvConsulEnabled, "false")
-
+func TestModuleCanDisableRegistry(t *testing.T) {
 	var registry *ConsulRegistry
-	app := moduleApp(t, options, &registry)
+	app := fxtest.New(t,
+		fx.NopLogger,
+		fx.Supply(Options{}, testAppInfo, zaptest.NewLogger(t)),
+		Module,
+		fx.Populate(&registry),
+	)
+	require.NoError(t, app.Err())
+	assert.Nil(t, registry)
 	app.RequireStart()
 	app.RequireStop()
-	assert.Nil(t, registry)
-	assert.Zero(t, agent.RegisterCalls())
+}
+
+func TestModuleRejectsEnabledRegistryWithoutAddress(t *testing.T) {
+	options := testOptions("0.0.0.0:30006", time.Second)
+	app := fx.New(
+		fx.NopLogger,
+		fx.Supply(options, testAppInfo, zaptest.NewLogger(t)),
+		Module,
+	)
+	require.ErrorIs(t, app.Err(), ErrInvalidOptions)
 }
 
 func TestRegisterUsesProviderNeutralOptions(t *testing.T) {
@@ -259,6 +268,7 @@ func TestRegisterUsesProviderNeutralOptions(t *testing.T) {
 	registry := newRegistry(t, agent.address)
 	options := testOptions("0.0.0.0:30006", time.Second)
 	require.NoError(t, registry.Register(options, testAppInfo))
+	assert.True(t, agent.ReplaceExistingChecks())
 
 	registration := agent.Registered()
 	require.NotNil(t, registration)
@@ -270,6 +280,7 @@ func TestRegisterUsesProviderNeutralOptions(t *testing.T) {
 	require.NotNil(t, registration.Check)
 	assert.Equal(t, "service:"+testAppInfo.ID, registration.Check.CheckID)
 	assert.Equal(t, "30s", registration.Check.TTL)
+	assert.Equal(t, api.HealthCritical, registration.Check.Status)
 	assert.Equal(t, "1m", registration.Check.DeregisterCriticalServiceAfter)
 	require.Len(t, registration.Checks, 1)
 	assert.Equal(t, "service:"+testAppInfo.ID+":grpc-readiness", registration.Checks[0].CheckID)
@@ -310,6 +321,14 @@ func TestRegisterRejectsInvalidServerAndMissingTTL(t *testing.T) {
 	options = testOptions("0.0.0.0:30006", time.Second)
 	options.Check.DeregisterCriticalServiceAfter = "-1s"
 	require.ErrorIs(t, registry.Register(options, testAppInfo), ErrInvalidOptions)
+
+	options = testOptions("0.0.0.0:30006", time.Second)
+	options.Check.DeregisterCriticalServiceAfter = ""
+	require.ErrorIs(t, registry.Register(options, testAppInfo), ErrInvalidOptions)
+
+	options = testOptions("0.0.0.0:30006", 0)
+	options.Check.TTL.Duration = "5s"
+	require.ErrorIs(t, registry.Register(options, testAppInfo), ErrInvalidOptions)
 	assert.Nil(t, agent.Registered())
 }
 
@@ -340,7 +359,7 @@ func TestTTLPingerUsesExplicitCheckIDAndStops(t *testing.T) {
 func TestTTLPingerFirstPingIsImmediate(t *testing.T) {
 	agent := startFakeConsulAgent(t)
 	registry := newRegistry(t, agent.address)
-	options := testOptions("0.0.0.0:30006", 30*time.Second)
+	options := testOptions("0.0.0.0:30006", 20*time.Second)
 	require.NoError(t, registry.Register(options, testAppInfo))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -360,6 +379,116 @@ func TestTTLPingerDefaultsMissingIntervalWithoutPanic(t *testing.T) {
 	assert.NotPanics(t, func() { registry.TTLCheckPinger(ctx, options) })
 }
 
+func TestLateRegistrationAfterShutdownStartsCriticalAndExpires(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	committed := make(chan api.AgentServiceRegistration, 1)
+	var releaseOnce sync.Once
+	releaseRegistration := func() { releaseOnce.Do(func() { close(release) }) }
+	var deregistered atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch {
+		case request.URL.Path == "/v1/agent/service/register":
+			var registration api.AgentServiceRegistration
+			_ = json.NewDecoder(request.Body).Decode(&registration)
+			close(started)
+			<-release // Deliberately ignore client cancellation and commit later.
+			committed <- registration
+		case strings.HasPrefix(request.URL.Path, "/v1/agent/service/deregister/"):
+			deregistered.Store(true)
+		default:
+			writer.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	defer releaseRegistration()
+
+	registry := newRegistry(t, strings.TrimPrefix(server.URL, "http://"))
+	options := testOptions("0.0.0.0:30006", time.Second)
+	maintainCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	registry.cancelMaintain = cancel
+	registry.maintainDone = done
+	go func() {
+		defer close(done)
+		registry.Maintain(maintainCtx, options, testAppInfo)
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("registration request did not start")
+	}
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), time.Second)
+	defer shutdownCancel()
+	require.NoError(t, registry.Shutdown(shutdownCtx))
+	assert.True(t, deregistered.Load())
+
+	releaseRegistration()
+	select {
+	case registration := <-committed:
+		require.NotNil(t, registration.Check)
+		assert.Equal(t, api.HealthCritical, registration.Check.Status,
+			"a late remote commit must never become routable without a heartbeat")
+		assert.Equal(t, "1m", registration.Check.DeregisterCriticalServiceAfter,
+			"Consul must eventually remove an unowned late registration")
+	case <-time.After(time.Second):
+		t.Fatal("simulated remote registration did not commit")
+	}
+}
+
+func TestShutdownCancelsAndJoinsInFlightRegistration(t *testing.T) {
+	started := make(chan struct{})
+	cancelled := make(chan struct{})
+	release := make(chan struct{})
+	var deregistered atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch {
+		case request.URL.Path == "/v1/agent/service/register":
+			var registration api.AgentServiceRegistration
+			_ = json.NewDecoder(request.Body).Decode(&registration)
+			close(started)
+			select {
+			case <-request.Context().Done():
+				close(cancelled)
+			case <-release:
+			}
+		case strings.HasPrefix(request.URL.Path, "/v1/agent/service/deregister/"):
+			deregistered.Store(true)
+		default:
+			writer.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	defer close(release)
+
+	registry := newRegistry(t, strings.TrimPrefix(server.URL, "http://"))
+	options := testOptions("0.0.0.0:30006", time.Second)
+	maintainCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	registry.cancelMaintain = cancel
+	registry.maintainDone = done
+	go func() {
+		defer close(done)
+		registry.Maintain(maintainCtx, options, testAppInfo)
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("registration request did not start")
+	}
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), time.Second)
+	defer shutdownCancel()
+	require.NoError(t, registry.Shutdown(shutdownCtx))
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("registration request did not observe shutdown cancellation")
+	}
+	assert.True(t, deregistered.Load())
+}
+
 func TestDeregisterStopsPingerFirst(t *testing.T) {
 	agent := startFakeConsulAgent(t)
 	registry := newRegistry(t, agent.address)
@@ -368,8 +497,9 @@ func TestDeregisterStopsPingerFirst(t *testing.T) {
 
 	pingCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	registry.cancelPing = cancel
 	done := make(chan struct{})
+	registry.cancelMaintain = cancel
+	registry.maintainDone = done
 	go func() {
 		defer close(done)
 		registry.TTLCheckPinger(pingCtx, options)
