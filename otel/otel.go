@@ -71,6 +71,26 @@ type Options struct {
 	RuntimeMetrics   bool
 }
 
+type shutdownGroup struct {
+	once  sync.Once
+	funcs []func(context.Context) error
+	err   error
+}
+
+func (group *shutdownGroup) add(shutdown func(context.Context) error) {
+	group.funcs = append(group.funcs, shutdown)
+}
+
+func (group *shutdownGroup) shutdown(ctx context.Context) error {
+	group.once.Do(func() {
+		for index := len(group.funcs) - 1; index >= 0; index-- {
+			group.err = errors.Join(group.err, group.funcs[index](ctx))
+		}
+		group.funcs = nil
+	})
+	return group.err
+}
+
 type sdkLifecycle struct {
 	mu       sync.RWMutex
 	shutdown func(context.Context) error
@@ -120,22 +140,8 @@ func SetupOTelSDK(ctx context.Context, info meta.AppInfo, options Options, logge
 		return func(context.Context) error { return nil }, nil
 	}
 
-	var (
-		shutdownMu    sync.Mutex
-		shutdownFuncs []func(context.Context) error
-	)
-	shutdown := func(ctx context.Context) error {
-		shutdownMu.Lock()
-		funcs := shutdownFuncs
-		shutdownFuncs = nil
-		shutdownMu.Unlock()
-
-		var err error
-		for index := len(funcs) - 1; index >= 0; index-- {
-			err = errors.Join(err, funcs[index](ctx))
-		}
-		return err
-	}
+	shutdowns := &shutdownGroup{}
+	shutdown := shutdowns.shutdown
 
 	// Keep SDK-internal failures on OpenTelemetry's stderr handler. Sending an
 	// exporter failure through the bridged application logger feeds it back into
@@ -152,7 +158,7 @@ func SetupOTelSDK(ctx context.Context, info meta.AppInfo, options Options, logge
 		if err != nil {
 			return shutdown, errors.Join(err, shutdown(ctx))
 		}
-		shutdownFuncs = append(shutdownFuncs, tracerProvider.Shutdown)
+		shutdowns.add(tracerProvider.Shutdown)
 		otel.SetTracerProvider(tracerProvider)
 	}
 
@@ -161,7 +167,7 @@ func SetupOTelSDK(ctx context.Context, info meta.AppInfo, options Options, logge
 		if err != nil {
 			return shutdown, errors.Join(err, shutdown(ctx))
 		}
-		shutdownFuncs = append(shutdownFuncs, meterProvider.Shutdown)
+		shutdowns.add(meterProvider.Shutdown)
 		otel.SetMeterProvider(meterProvider)
 
 		if options.RuntimeMetrics {
@@ -176,7 +182,7 @@ func SetupOTelSDK(ctx context.Context, info meta.AppInfo, options Options, logge
 		if err != nil {
 			return shutdown, errors.Join(err, shutdown(ctx))
 		}
-		shutdownFuncs = append(shutdownFuncs, loggerProvider.Shutdown)
+		shutdowns.add(loggerProvider.Shutdown)
 		global.SetLoggerProvider(loggerProvider)
 	}
 

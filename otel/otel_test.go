@@ -58,6 +58,38 @@ func TestModuleInitializesWithoutOutputConsumer(t *testing.T) {
 	require.NoError(t, app.Stop(context.Background()))
 }
 
+func TestShutdownGroupConcurrentCallersJoin(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	group := &shutdownGroup{}
+	group.add(func(context.Context) error {
+		close(started)
+		<-release
+		return nil
+	})
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- group.shutdown(context.Background()) }()
+	<-started
+
+	secondStarted := make(chan struct{})
+	secondDone := make(chan error, 1)
+	go func() {
+		close(secondStarted)
+		secondDone <- group.shutdown(context.Background())
+	}()
+	<-secondStarted
+	select {
+	case err := <-secondDone:
+		t.Fatalf("concurrent shutdown returned before the active flush completed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	require.NoError(t, <-firstDone)
+	require.NoError(t, <-secondDone)
+}
+
 func TestModuleDoesNotInitializeWhenFxNewFails(t *testing.T) {
 	before := sdktrace.NewTracerProvider()
 	apiotel.SetTracerProvider(before)
