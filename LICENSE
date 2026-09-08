@@ -1,0 +1,32 @@
+SPDX-License-Identifier: CC-BY-NC-SA-4.0
+
+Software License Agreement
+Version: 1.1
+
+Licensing Logic: Based on Creative Commons Attribution-NonCommercial-ShareAlike
+4.0 International (CC BY-NC-SA 4.0).
+Full legal code: https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode
+
+Copyright (c) 2026 lens077 <https://github.com/lens077>
+
+1. Copyleft and Derivative Works
+This software is provided under a Copyleft model. If you use, modify, or build upon the source code, logic, or derivative works of this project, you must release your contribution under the same or a more restrictive license. You are required to make the source code of your derivative project publicly available and provide a link back to this original repository.
+
+2. Non-Commercial Use Restriction
+This software and its source code are licensed strictly for personal learning, technical exchange, and non-profit research purposes.
+
+Any Commercial Use of this project—including but not limited to the source code, compiled binaries, API interfaces, and UI design—is strictly prohibited without prior explicit written authorization from the copyright holder. Prohibited commercial activities include, but are not limited to:
+
+Direct Sale: Selling the software or any derivative products based on this project.
+
+Service Integration (SaaS): Incorporating the software as part of a paid service, subscription model, or commercial outsourcing project.
+
+Monetized Platforms: Integrating the software’s functionality into platforms, websites, or applications that contain paid content or advertisements.
+
+3. Commercial Licensing and Special Authorization
+Users who wish to utilize this project in a commercial environment, or who seek an exemption from the Copyleft requirements (i.e., a closed-source commercial license), must contact the copyright holder for a formal commercial license agreement.
+
+Contact: https://github.com/lens077
+
+4. Disclaimer of Warranty
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

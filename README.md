@@ -63,3 +63,12 @@ Dockerfile 的注入长期无效，跑着的二进制无法自报由哪次构建
 
 `meta.Version` 表示**构建制品版本**，与 `AppInfo.Version`（API 契约版本，形如 `v1`，
 会进 Consul 服务标签与 OTel `service.version`）是两个不同概念，不要合并。
+
+## 许可
+
+本项目采用 **[CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/)**
+（署名—非商业性使用—相同方式共享）授权，详见 [`LICENSE`](LICENSE)：
+
+- 可用于个人学习、技术交流与非营利研究；衍生作品须以相同或更严格的协议开源，并注明出处。
+- **任何商业使用**（直接售卖、SaaS 集成、含付费内容或广告的平台等）须事先获得书面授权。
+- 商业授权或闭源例外请联系版权方：<https://github.com/lens077>
