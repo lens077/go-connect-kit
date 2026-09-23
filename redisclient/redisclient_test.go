@@ -1,6 +1,7 @@
 package redisclient
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -14,6 +15,8 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func testCAPEM(t *testing.T) string {
@@ -63,6 +66,30 @@ func TestBuildOptionsTLS(t *testing.T) {
 
 	_, err = buildOptions(Options{Addr: "cache:6379", TLS: TLSOptions{Enabled: true, CAPEM: "not a pem"}})
 	assert.ErrorContains(t, err, "CA PEM")
+}
+
+// A failed build used to print one "failed to dial" line per MinIdleConns background dial,
+// straight to stderr: 12 lines for one unreachable address in a 2026-09-24 hot-reload test.
+func TestFailedBuildLogsOnceThroughZap(t *testing.T) {
+	core, logs := observer.New(zap.DebugLevel)
+	logger := zap.New(core)
+
+	_, err := Build(context.Background(), Options{
+		Addr:         "127.0.0.1:1", // connection refused, no network needed
+		DialTimeout:  time.Second,
+		PoolSize:     10,
+		MinIdleConns: 5,
+	}, logger)
+	require.Error(t, err)
+
+	// Background dials, if any were started, finish their retries and log after Build returns.
+	time.Sleep(1500 * time.Millisecond)
+
+	redisLines := logs.FilterField(zap.String("component", "go-redis")).All()
+	assert.LessOrEqual(t, len(redisLines), 1, "only the probe's own dial failure may be logged")
+	for _, entry := range redisLines {
+		assert.Equal(t, zap.WarnLevel, entry.Level)
+	}
 }
 
 func TestLiveSwap(t *testing.T) {

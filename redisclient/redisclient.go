@@ -138,9 +138,34 @@ func Build(ctx context.Context, options Options, logger *zap.Logger) (*redis.Cli
 	if err != nil {
 		return nil, err
 	}
+	routeLibraryLogs(logger)
+	if err := probe(ctx, clientOptions, options, logger); err != nil {
+		return nil, err
+	}
+
 	// Metrics must be installed before the first client exists, or its pool gauges are missed.
 	otelpkg.EnsureRedisInstrumentation(logger)
 	client := redis.NewClient(clientOptions)
+	logger.Info("redis connected", zap.String("addr", options.Addr), zap.Bool("tls", options.TLS.Enabled))
+	return client, nil
+}
+
+// probe pings through a throwaway client that keeps no idle connections.
+//
+// redis.NewClient starts one background dial per MinIdleConns as soon as it is called, and
+// each of them logs its own failure after retrying. Probing first means an unreachable
+// server costs one dial failure instead of MinIdleConns+1, and the real client only fills
+// its idle connections once the server is known to answer.
+func probe(ctx context.Context, clientOptions *redis.Options, options Options, logger *zap.Logger) error {
+	probeOptions := *clientOptions
+	probeOptions.MinIdleConns = 0
+	probeOptions.PoolSize = 1
+	client := redis.NewClient(&probeOptions)
+	defer func() {
+		if err := client.Close(); err != nil {
+			logger.Warn("closing redis probe client failed", zap.String("addr", options.Addr), zap.Error(err))
+		}
+	}()
 
 	timeout := options.DialTimeout
 	if timeout <= 0 {
@@ -149,14 +174,31 @@ func Build(ctx context.Context, options Options, logger *zap.Logger) (*redis.Cli
 	pingCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	if err := client.Ping(pingCtx).Err(); err != nil {
-		if closeErr := client.Close(); closeErr != nil {
-			logger.Warn("closing redis client after ping failure failed", zap.String("addr", options.Addr), zap.Error(closeErr))
-		}
-		return nil, fmt.Errorf("redisclient: ping %s: %w", options.Addr, err)
+		return fmt.Errorf("redisclient: ping %s: %w", options.Addr, err)
 	}
+	return nil
+}
 
-	logger.Info("redis connected", zap.String("addr", options.Addr), zap.Bool("tls", options.TLS.Enabled))
-	return client, nil
+var (
+	libraryLogger     atomic.Pointer[zap.Logger]
+	libraryLoggerOnce sync.Once
+)
+
+// routeLibraryLogs sends go-redis's own log lines (dial failures, pool errors) through zap.
+// go-redis otherwise prints them to stderr with the standard log package, where level
+// filtering, JSON format and the OTel log bridge do not apply. The go-redis logger is
+// process-global, so the adapter is installed once and follows the latest Build's logger.
+func routeLibraryLogs(logger *zap.Logger) {
+	libraryLogger.Store(logger.With(zap.String("component", "go-redis")))
+	libraryLoggerOnce.Do(func() { redis.SetLogger(zapLibraryLogger{}) })
+}
+
+type zapLibraryLogger struct{}
+
+func (zapLibraryLogger) Printf(_ context.Context, format string, args ...any) {
+	if logger := libraryLogger.Load(); logger != nil {
+		logger.Warn(fmt.Sprintf(format, args...))
+	}
 }
 
 // buildOptions turns options into go-redis options without touching the network.

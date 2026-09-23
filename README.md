@@ -65,6 +65,11 @@ fx.Module("data",
   （localhost 或本机 socket）的明文连接。
 - 数组形式的自定义枚举参数需要在 `TypeNames` 里同时列出类型与数组类型（如 `cart.cart_type`、
   `cart._cart_type`）：pgx 对未知标量 OID 有文本回退，对数组没有。
+- `redisclient.Build` 先用不预建空闲连接的临时客户端 ping，通了才创建真正的客户端。
+  `redis.NewClient` 一创建就会为每个 `MinIdleConns` 起一个后台连接并各自重试、各自报错，
+  地址不可达时一次重建会打十几行（2026-09-24 热重建实测 12 行）；先探测后只剩一行。
+- go-redis 自己的日志（连接失败、连接池错误）经 `redis.SetLogger` 转到 zap，级别 Warn，
+  带 `component=go-redis`。该设置是进程级的，由第一次 `Build` 安装，之后跟随最近一次 `Build` 的 logger。
 
 ## 版本约束
 
