@@ -28,6 +28,8 @@
 | `otel` | trace、metric、log 管道，资源、传播、Fx 生命周期与数据库/Redis 埋点辅助 | OpenTelemetry |
 | `registry` | Consul 注册、TTL 心跳、可选 gRPC 就绪检查、Fx 生命周期与故障自恢复 | Consul API、Fx |
 | `dbutil` | pgx / PostgreSQL 错误识别、业务错误映射与可选日志回调 | `pgx/v5`、`lib/pq/pqerror` |
+| `pgpool` | pgx 连接池构建（libpq `sslmode` 语义、SQL 追踪、池指标、自定义类型注册）与随配置热替换的 `Live` 外壳 | `pgx/v5`、`otelpgx`、`config.Live` |
+| `redisclient` | go-redis 客户端构建（TLS、指标）与随配置热替换的 `Live` 外壳 | `go-redis/v9`、`config.Live` |
 
 这些包只接收提供方无关的 Go `Options`，不导入消费方的 protobuf。消费方保留很薄的
 protobuf-to-options adapter；配置源的具体实现也由消费方适配 `config.Source` / `config.Watcher`。
@@ -36,6 +38,33 @@ protobuf-to-options adapter；配置源的具体实现也由消费方适配 `con
 因此共享实现只在这里维护一份。
 
 BSR 不参与这条发布链路：BSR 分发 proto，不分发 Go 实现。本模块作为普通 Go module 发布。
+
+## `pgpool` 与 `redisclient`
+
+两个包替换的是此前每个服务各存一份的 `buildPgPool` / `buildRedis` 与 `PgPool` / `LiveRedis`
+外壳。2026-09-24 在 ecommerce 实测：约 1,700 行副本，已经开始分叉（只有一个服务修了自定义
+枚举数组的类型注册），并且落在同构门禁的扫描范围之外。
+
+消费方用法（`T` 是消费方自己的配置消息）：
+
+```go
+fx.Module("data",
+	pgpool.Module[*confv1.Bootstrap](postgresOptions),
+	redisclient.Module[*confv1.Bootstrap](redisOptions),
+	fx.Provide(NewData),
+)
+```
+
+- `*pgpool.Live` 实现 sqlc 的 `DBTX` 与 `otelpgx.PoolStats`：`models.New(live)` 在换池后仍然有效，
+  池指标只注册一次并始终跟随当前池。
+- `*redisclient.Live` 只暴露 `Client()`。每次使用时取，不要把返回值存进字段——配置变更后它会被关闭。
+- 配置投影出的 `Options` 变化时才重建；新池或新客户端 ping 不通就保留旧的，旧的延迟 30 秒关闭。
+- `pgpool.Options.SSLMode` 按 libpq 语义处理：`allow` / `prefer` 的第二次尝试只连同一主机；
+  `verify-ca` / `verify-full` 未提供 CA 时使用系统根证书，不会静默降级为不校验。
+  此前的副本以 `ParseConfig("")` 为模板却没清掉它生成的 `Fallbacks`，连接失败时会改用默认主机
+  （localhost 或本机 socket）的明文连接。
+- 数组形式的自定义枚举参数需要在 `TypeNames` 里同时列出类型与数组类型（如 `cart.cart_type`、
+  `cart._cart_type`）：pgx 对未知标量 OID 有文本回退，对数组没有。
 
 ## 版本约束
 
