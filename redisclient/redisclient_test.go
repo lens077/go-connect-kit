@@ -12,11 +12,17 @@ import (
 	"testing"
 	"time"
 
+	"errors"
+	"strings"
+
+	"github.com/lens077/go-connect-kit/config"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/fx/fxtest"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 func testCAPEM(t *testing.T) string {
@@ -101,4 +107,34 @@ func TestLiveSwap(t *testing.T) {
 	assert.Same(t, first, live.Client())
 	assert.Same(t, first, live.swap(second), "swap hands the old client back for delayed close")
 	assert.Same(t, second, live.Client())
+}
+
+func TestStaleReportsFailedRebuildUntilResolved(t *testing.T) {
+	unreachable := errors.New("no such host")
+	build := func(_ context.Context, options Options, _ *zap.Logger) (*redis.Client, error) {
+		if strings.HasPrefix(options.Addr, "down") {
+			return nil, unreachable
+		}
+		client := redis.NewClient(&redis.Options{Addr: options.Addr})
+		t.Cleanup(func() { _ = client.Close() })
+		return client, nil
+	}
+	project := func(c *wrapperspb.StringValue) Options { return Options{Addr: c.GetValue()} }
+	source := config.NewLive(wrapperspb.String("127.0.0.1:6379"))
+
+	live, err := newLive(fxtest.NewLifecycle(t), project, source.Get(), source, zap.NewNop(), build)
+	require.NoError(t, err)
+	first := live.Client()
+
+	source.Set(wrapperspb.String("down:6379"))
+	assert.ErrorIs(t, live.Stale(), unreachable)
+	assert.Same(t, first, live.Client())
+
+	source.Set(wrapperspb.String("127.0.0.1:6379"))
+	assert.NoError(t, live.Stale())
+
+	source.Set(wrapperspb.String("down:6379"))
+	source.Set(wrapperspb.String("127.0.0.1:6380"))
+	assert.NoError(t, live.Stale())
+	assert.Equal(t, "127.0.0.1:6380", live.Client().Options().Addr)
 }

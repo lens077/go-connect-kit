@@ -65,6 +65,10 @@ fx.Module("data",
   （localhost 或本机 socket）的明文连接。
 - 数组形式的自定义枚举参数需要在 `TypeNames` 里同时列出类型与数组类型（如 `cart.cart_type`、
   `cart._cart_type`）：pgx 对未知标量 OID 有文本回退，对数组没有。
+- 重建失败时 `Live.Stale()` 返回原因，同时指标 `connectkit.config.stale{component="pgpool|redisclient"}`
+  变为 1；重建成功或配置改回当前在用的值后清零。旧连接仍在服务，所以**它不该让健康检查失败**：
+  所有副本收到同一份推送、同样失败，readiness 失败会同时摘掉全部副本，liveness 失败会把它们
+  重启进那份坏配置。消费方把它放在健康响应的警告字段里，并对指标配告警。
 - `redisclient.Build` 先用不预建空闲连接的临时客户端 ping，通了才创建真正的客户端。
   `redis.NewClient` 一创建就会为每个 `MinIdleConns` 起一个后台连接并各自重试、各自报错，
   地址不可达时一次重建会打十几行（2026-09-24 热重建实测 12 行）；先探测后只剩一行。

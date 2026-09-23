@@ -23,6 +23,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/lens077/go-connect-kit/config"
+	"github.com/lens077/go-connect-kit/internal/stale"
 	otelpkg "github.com/lens077/go-connect-kit/otel"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
@@ -99,7 +100,10 @@ type Projector[T proto.Message] func(T) Options
 // implements otelpgx.PoolStats, so pool metrics are registered once and follow the
 // current pool; otelpgx has no way to unregister, and registering per pool would
 // report duplicates.
-type Live struct{ p atomic.Pointer[pgxpool.Pool] }
+type Live struct {
+	p     atomic.Pointer[pgxpool.Pool]
+	stale stale.State
+}
 
 // NewLive wraps an existing pool. Module is the normal constructor; this exists for
 // tests that bring their own pool.
@@ -114,6 +118,15 @@ func NewLive(pool *pgxpool.Pool) *Live {
 func (l *Live) Pool() *pgxpool.Pool { return l.p.Load() }
 
 func (l *Live) swap(pool *pgxpool.Pool) *pgxpool.Pool { return l.p.Swap(pool) }
+
+// Stale reports why the most recently pushed configuration is not in use: rebuilding with it
+// failed and the previous pool is still serving. It is nil once the pool matches the latest
+// push again, through a successful rebuild or a push back to the configuration in use.
+//
+// Report it next to health checks, not as a failed check. Every replica receives the same
+// push and fails the same way, so failing readiness would drain all of them while the old
+// pool still works, and failing liveness would restart them into the bad configuration.
+func (l *Live) Stale() error { return l.stale.Err() }
 
 // Exec implements sqlc's DBTX against the current pool.
 func (l *Live) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
@@ -142,14 +155,16 @@ func (l *Live) Config() *pgxpool.Config { return l.p.Load().Config() }
 func Module[T proto.Message](project Projector[T]) fx.Option {
 	return fx.Module("pgpool",
 		fx.Provide(func(lc fx.Lifecycle, conf T, live *config.Live[T], logger *zap.Logger) (*Live, error) {
-			return newLive(lc, project, conf, live, logger)
+			return newLive(lc, project, conf, live, logger, Build)
 		}),
 	)
 }
 
-func newLive[T proto.Message](lc fx.Lifecycle, project Projector[T], conf T, live *config.Live[T], logger *zap.Logger) (*Live, error) {
+type buildFunc func(context.Context, Options, *zap.Logger) (*pgxpool.Pool, error)
+
+func newLive[T proto.Message](lc fx.Lifecycle, project Projector[T], conf T, live *config.Live[T], logger *zap.Logger, build buildFunc) (*Live, error) {
 	applied := project(conf)
-	pool, err := Build(context.Background(), applied, logger)
+	pool, err := build(context.Background(), applied, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -157,6 +172,10 @@ func newLive[T proto.Message](lc fx.Lifecycle, project Projector[T], conf T, liv
 	if err := otelpgx.RecordStats(holder); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("pgpool: record pool stats: %w", err)
+	}
+	if err := stale.Register("pgpool", &holder.stale); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("pgpool: %w", err)
 	}
 
 	// Compare against the options actually in use rather than the previous snapshot, so a
@@ -167,17 +186,21 @@ func newLive[T proto.Message](lc fx.Lifecycle, project Projector[T], conf T, liv
 		mu.Lock()
 		defer mu.Unlock()
 		if next.equal(applied) {
+			// Also reached when a failed push is reverted: the pool already matches it.
+			holder.stale.Set(nil)
 			return
 		}
 		logger.Info("database config changed, rebuilding pool", zap.String("host", next.Host))
-		pool, err := Build(context.Background(), next, logger)
+		pool, err := build(context.Background(), next, logger)
 		if err != nil {
 			logger.Error("rebuild database pool failed, keeping the current one", zap.Error(err))
+			holder.stale.Set(fmt.Errorf("latest config not applied, previous pool still in use: %w", err))
 			return
 		}
 		// Swap only after the new pool answered a ping, so the visible pool always works.
 		prev := holder.swap(pool)
 		applied = next
+		holder.stale.Set(nil)
 		logger.Info("database pool rebuilt")
 		if prev != nil {
 			time.AfterFunc(drainTimeout, prev.Close)

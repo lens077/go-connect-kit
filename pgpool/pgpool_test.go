@@ -12,12 +12,19 @@ import (
 	"testing"
 	"time"
 
+	"errors"
+	"strings"
+
 	"github.com/exaring/otelpgx"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/lens077/go-connect-kit/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/fx/fxtest"
+	"go.uber.org/zap"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 // dbtx mirrors the interface sqlc generates for every consumer's models package.
@@ -230,4 +237,36 @@ func boolString(value bool) string {
 		return "yes"
 	}
 	return "no"
+}
+
+// A failed rebuild used to leave no trace outside one ERROR line: the config source showed
+// the new version and health stayed green (2026-09-24 ecommerce hot-reload test).
+func TestStaleReportsFailedRebuildUntilResolved(t *testing.T) {
+	unreachable := errors.New("no such host")
+	build := func(_ context.Context, options Options, _ *zap.Logger) (*pgxpool.Pool, error) {
+		if strings.HasSuffix(options.Host, ".invalid") {
+			return nil, unreachable
+		}
+		return lazyPool(t, "postgres://u:p@127.0.0.1:5432/"+options.Host), nil
+	}
+	project := func(c *wrapperspb.StringValue) Options { return Options{Host: c.GetValue()} }
+	source := config.NewLive(wrapperspb.String("a"))
+
+	live, err := newLive(fxtest.NewLifecycle(t), project, source.Get(), source, zap.NewNop(), build)
+	require.NoError(t, err)
+	first := live.Pool()
+	require.NoError(t, live.Stale())
+
+	source.Set(wrapperspb.String("down.invalid"))
+	assert.ErrorIs(t, live.Stale(), unreachable)
+	assert.Same(t, first, live.Pool(), "the previous pool keeps serving")
+
+	source.Set(wrapperspb.String("a"))
+	assert.NoError(t, live.Stale(), "reverting to the config in use resolves it without a rebuild")
+	assert.Same(t, first, live.Pool())
+
+	source.Set(wrapperspb.String("down.invalid"))
+	source.Set(wrapperspb.String("b"))
+	assert.NoError(t, live.Stale(), "a successful rebuild resolves it")
+	assert.Equal(t, "b", live.Config().ConnConfig.Database)
 }

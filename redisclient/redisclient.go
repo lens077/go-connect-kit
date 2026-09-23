@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/lens077/go-connect-kit/config"
+	"github.com/lens077/go-connect-kit/internal/stale"
 	otelpkg "github.com/lens077/go-connect-kit/otel"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/fx"
@@ -63,7 +64,10 @@ type Projector[T proto.Message] func(T) Options
 // redis.Client has too many methods to forward, so callers go through Client() every
 // time. Never store its result in a struct field or package variable: that brings back
 // "captured once at startup", and the stored client is closed after the next change.
-type Live struct{ c atomic.Pointer[redis.Client] }
+type Live struct {
+	c     atomic.Pointer[redis.Client]
+	stale stale.State
+}
 
 // NewLive wraps an existing client. Module is the normal constructor; this exists for
 // tests that bring their own client.
@@ -78,23 +82,33 @@ func (l *Live) Client() *redis.Client { return l.c.Load() }
 
 func (l *Live) swap(client *redis.Client) *redis.Client { return l.c.Swap(client) }
 
+// Stale reports why the most recently pushed configuration is not in use; see pgpool.Live.Stale
+// for the semantics and for why it must not fail health checks.
+func (l *Live) Stale() error { return l.stale.Err() }
+
 // Module provides a *Live built from the caller's configuration and rebuilds it when the
 // projected Options change. A rebuild that fails keeps the current client.
 func Module[T proto.Message](project Projector[T]) fx.Option {
 	return fx.Module("redisclient",
 		fx.Provide(func(lc fx.Lifecycle, conf T, live *config.Live[T], logger *zap.Logger) (*Live, error) {
-			return newLive(lc, project, conf, live, logger)
+			return newLive(lc, project, conf, live, logger, Build)
 		}),
 	)
 }
 
-func newLive[T proto.Message](lc fx.Lifecycle, project Projector[T], conf T, live *config.Live[T], logger *zap.Logger) (*Live, error) {
+type buildFunc func(context.Context, Options, *zap.Logger) (*redis.Client, error)
+
+func newLive[T proto.Message](lc fx.Lifecycle, project Projector[T], conf T, live *config.Live[T], logger *zap.Logger, build buildFunc) (*Live, error) {
 	applied := project(conf)
-	client, err := Build(context.Background(), applied, logger)
+	client, err := build(context.Background(), applied, logger)
 	if err != nil {
 		return nil, err
 	}
 	holder := NewLive(client)
+	if err := stale.Register("redisclient", &holder.stale); err != nil {
+		_ = client.Close()
+		return nil, fmt.Errorf("redisclient: %w", err)
+	}
 
 	// Compare against the options actually in use, so a failed rebuild is retried by the
 	// next push that differs from what is running.
@@ -104,16 +118,20 @@ func newLive[T proto.Message](lc fx.Lifecycle, project Projector[T], conf T, liv
 		mu.Lock()
 		defer mu.Unlock()
 		if next == applied {
+			// Also reached when a failed push is reverted: the client already matches it.
+			holder.stale.Set(nil)
 			return
 		}
 		logger.Info("redis config changed, rebuilding client", zap.String("addr", next.Addr))
-		client, err := Build(context.Background(), next, logger)
+		client, err := build(context.Background(), next, logger)
 		if err != nil {
 			logger.Error("rebuild redis client failed, keeping the current one", zap.Error(err))
+			holder.stale.Set(fmt.Errorf("latest config not applied, previous client still in use: %w", err))
 			return
 		}
 		prev := holder.swap(client)
 		applied = next
+		holder.stale.Set(nil)
 		logger.Info("redis client rebuilt")
 		if prev != nil {
 			time.AfterFunc(drainTimeout, func() {
