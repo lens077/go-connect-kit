@@ -3,6 +3,8 @@ package stale
 import (
 	"context"
 	"errors"
+	"os"
+	"os/exec"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -13,20 +15,42 @@ import (
 )
 
 func TestGaugeFollowsState(t *testing.T) {
+	if os.Getenv("STALE_GAUGE_TEST_CHILD") == "1" {
+		testGaugeFollowsState(t)
+		return
+	}
+
+	// OpenTelemetry's global provider and this package's metric registry intentionally live
+	// for the process lifetime. Run the assertions in a fresh process so -count=N remains a
+	// valid isolation check instead of replacing globals that production never replaces.
+	command := exec.Command(os.Args[0], "-test.run=^TestGaugeFollowsState$", "-test.count=1")
+	command.Env = append(os.Environ(), "STALE_GAUGE_TEST_CHILD=1")
+	output, err := command.CombinedOutput()
+	require.NoError(t, err, "%s", output)
+}
+
+func testGaugeFollowsState(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
+
+	// Match application startup: resources register instruments during Fx construction,
+	// then the OTel module installs the real provider in OnStart.
+	var pgState, redisState State
+	require.NoError(t, Register("pgpool", &pgState))
+	require.NoError(t, Register("redisclient", &redisState))
 	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
-
-	var state State
-	require.NoError(t, Register("pgpool", &state))
 	assert.Equal(t, int64(0), gauge(t, reader, "pgpool"))
+	assert.Equal(t, int64(0), gauge(t, reader, "redisclient"))
 
-	state.Set(errors.New("rebuild failed"))
-	assert.EqualError(t, state.Err(), "rebuild failed")
+	pgState.Set(errors.New("rebuild failed"))
+	assert.EqualError(t, pgState.Err(), "rebuild failed")
 	assert.Equal(t, int64(1), gauge(t, reader, "pgpool"))
+	assert.Equal(t, int64(0), gauge(t, reader, "redisclient"))
 
-	state.Set(nil)
-	assert.NoError(t, state.Err())
+	pgState.Set(nil)
+	redisState.Set(errors.New("rebuild failed"))
+	assert.NoError(t, pgState.Err())
 	assert.Equal(t, int64(0), gauge(t, reader, "pgpool"))
+	assert.Equal(t, int64(1), gauge(t, reader, "redisclient"))
 }
 
 func gauge(t *testing.T, reader *sdkmetric.ManualReader, component string) int64 {
