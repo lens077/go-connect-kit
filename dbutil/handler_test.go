@@ -3,11 +3,13 @@ package dbutil
 import (
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/lens077/go-connect-kit/errinfo"
 	"github.com/lib/pq/pqerror"
 )
 
@@ -132,4 +134,19 @@ func TestWrapError(t *testing.T) {
 	if !strings.Contains(got.Error(), "create product") {
 		t.Fatalf("WrapError(unmapped) = %q, want context", got)
 	}
+}
+
+// 未映射的数据库错误会变成 unknown/internal，拦截器要靠它记录的位置定位到数据层那一行。
+func TestMustHandleErrorRecordsCallerOrigin(t *testing.T) {
+	handler := NewHandler()
+	got, wantLine := handler.MustHandleError(&pgconn.PgError{Code: "57014", Message: "canceled"}), callerLine()
+	origin, ok := errinfo.OriginOf(got)
+	if !ok || origin.Line != wantLine || !strings.HasSuffix(origin.File, "handler_test.go") {
+		t.Fatalf("origin = %+v (ok=%v), want handler_test.go:%d", origin, ok, wantLine)
+	}
+}
+
+func callerLine() int {
+	_, _, line, _ := runtime.Caller(1)
+	return line
 }

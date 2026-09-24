@@ -7,6 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/lens077/go-connect-kit/errinfo"
 	"github.com/lib/pq/pqerror"
 )
 
@@ -72,7 +73,13 @@ func NewHandler(opts ...HandlerOption) *Handler {
 }
 
 // HandleError maps known errors and reports whether a mapping was applied.
+// 非 nil 结果都带上调用方（数据层）的源码位置，见 errinfo.Here。
 func (h *Handler) HandleError(err error, noRowsErr ...error) (error, bool) {
+	res, handled := h.handleError(err, noRowsErr...)
+	return errinfo.HereSkip(res, 1), handled
+}
+
+func (h *Handler) handleError(err error, noRowsErr ...error) (error, bool) {
 	if err == nil {
 		return nil, false
 	}
@@ -116,15 +123,21 @@ func (h *Handler) HandleError(err error, noRowsErr ...error) (error, bool) {
 
 // WrapError returns a mapped error or wraps an unmapped error with context.
 func (h *Handler) WrapError(err error, wrapMsg string) error {
-	wrappedErr, handled := h.HandleError(err)
+	wrappedErr, handled := h.handleError(err)
 	if handled {
-		return wrappedErr
+		return errinfo.HereSkip(wrappedErr, 1)
 	}
-	return fmt.Errorf("%s: %w", wrapMsg, err)
+	return errinfo.HereSkip(fmt.Errorf("%s: %w", wrapMsg, err), 1)
 }
 
 // MustHandleError maps known errors and formats all remaining PostgreSQL errors.
+// 非 nil 结果都带上调用方（数据层）的源码位置：RPC 日志由拦截器统一打印，
+// 没有这个位置时 zap caller 永远指向拦截器，无法据此 blame（2026-09-24）。
 func (h *Handler) MustHandleError(err error, noRowsErr ...error) error {
+	return errinfo.HereSkip(h.mustHandleError(err, noRowsErr...), 1)
+}
+
+func (h *Handler) mustHandleError(err error, noRowsErr ...error) error {
 	if err == nil {
 		return nil
 	}
