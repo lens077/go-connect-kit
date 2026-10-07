@@ -26,6 +26,7 @@
 | `configschema` | 用生成的 JSON Schema 校验 YAML，并只返回脱敏错误路径 | JSON Schema、YAML |
 | `log` | Zap 构造、Fx 事件日志，以及 stdout/OTel 一致的应用日志级别热更新 | Zap、OTel bridge、`config.Live` |
 | `otel` | trace、metric、log 管道，资源、传播、Fx 生命周期与数据库/Redis 埋点辅助 | OpenTelemetry |
+| `otelguard` | 指标导出器的退避与熔断：失败不刷业务日志、熔断/恢复各发一次 ntfy 告警、半开探测自动复原 | OpenTelemetry、Zap |
 | `registry` | Consul 注册、TTL 心跳、可选 gRPC 就绪检查、Fx 生命周期与故障自恢复 | Consul API、Fx |
 | `dbutil` | pgx / PostgreSQL 错误识别、业务错误映射与可选日志回调；非 nil 结果带数据层调用点（`errinfo`） | `pgx/v5`、`lib/pq/pqerror` |
 | `errinfo` | 带有界 reason 的哨兵错误（`errinfo.New("CART_EMPTY", …)`）与抛错点记录（`errinfo.Here`） | 无（仅标准库） |
