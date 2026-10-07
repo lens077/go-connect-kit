@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/lens077/go-connect-kit/meta"
+	"github.com/lens077/go-connect-kit/otelguard"
 	redisotel "github.com/redis/go-redis/extra/redisotel-native/v9"
 	otelruntime "go.opentelemetry.io/contrib/instrumentation/runtime"
 	"go.opentelemetry.io/otel"
@@ -54,6 +55,11 @@ type MetricOptions struct {
 	Endpoint       string
 	ExportInterval time.Duration
 	TLS            TLSOptions
+	// Guard wraps the metric exporter in otelguard: backoff, circuit breaking
+	// and ntfy alerts. Nil means the defaults from otelguard.ConfigFromEnv(),
+	// so a service is protected without any code of its own; set Disabled to
+	// opt out (also possible with OTEL_GUARD_DISABLED=true).
+	Guard *otelguard.Config
 }
 
 // LoggingOptions configures OTLP log export.
@@ -143,10 +149,14 @@ func SetupOTelSDK(ctx context.Context, info meta.AppInfo, options Options, logge
 	shutdowns := &shutdownGroup{}
 	shutdown := shutdowns.shutdown
 
-	// Keep SDK-internal failures on OpenTelemetry's stderr handler. Sending an
-	// exporter failure through the bridged application logger feeds it back into
-	// the same failing OTLP log pipeline.
+	// SDK-internal failures stay off the bridged application logger: sending an
+	// exporter failure through the application logger feeds it back into the
+	// same failing OTLP log pipeline. With a metric guard installed they are
+	// filtered (silent while the circuit is open, one warning per interval
+	// otherwise); without one the default stderr handler stays in place.
 	otel.SetTextMapPropagator(newPropagator())
+
+	var guards []*otelguard.GuardedExporter
 
 	res, err := newResource(info, options.ServiceNamespace)
 	if err != nil {
@@ -163,12 +173,16 @@ func SetupOTelSDK(ctx context.Context, info meta.AppInfo, options Options, logge
 	}
 
 	if options.Metric != nil {
-		meterProvider, err := newMeterProvider(ctx, res, *options.Metric, options.RuntimeMetrics, logger)
+		meterProvider, guard, err := newMeterProvider(ctx, res, info, *options.Metric, options.RuntimeMetrics, logger)
 		if err != nil {
 			return shutdown, errors.Join(err, shutdown(ctx))
 		}
 		shutdowns.add(meterProvider.Shutdown)
 		otel.SetMeterProvider(meterProvider)
+
+		if guard != nil {
+			guards = append(guards, guard)
+		}
 
 		if options.RuntimeMetrics {
 			if err := otelruntime.Start(); err != nil {
@@ -184,6 +198,11 @@ func SetupOTelSDK(ctx context.Context, info meta.AppInfo, options Options, logge
 		}
 		shutdowns.add(loggerProvider.Shutdown)
 		global.SetLoggerProvider(loggerProvider)
+	}
+
+	// Installed once every signal is wired, so the predicate sees them all.
+	if len(guards) > 0 {
+		otel.SetErrorHandler(otelguard.NewSilentErrorHandler(anyGuardOpen(guards), logger, guards[0].Config().ErrorLogInterval))
 	}
 
 	return shutdown, nil
@@ -297,7 +316,7 @@ func newTracerProvider(ctx context.Context, res *resource.Resource, options Trac
 	), nil
 }
 
-func newMeterProvider(ctx context.Context, res *resource.Resource, options MetricOptions, runtimeMetrics bool, logger *zap.Logger) (*metric.MeterProvider, error) {
+func newMeterProvider(ctx context.Context, res *resource.Resource, info meta.AppInfo, options MetricOptions, runtimeMetrics bool, logger *zap.Logger) (*metric.MeterProvider, *otelguard.GuardedExporter, error) {
 	exporterOptions := []otlpmetrichttp.Option{
 		otlpmetrichttp.WithEndpoint(options.Endpoint),
 		otlpmetrichttp.WithCompression(otlpmetrichttp.GzipCompression),
@@ -308,9 +327,16 @@ func newMeterProvider(ctx context.Context, res *resource.Resource, options Metri
 		exporterOptions = append(exporterOptions, otlpmetrichttp.WithInsecure())
 	}
 
-	exporter, err := otlpmetrichttp.New(ctx, exporterOptions...)
+	inner, err := otlpmetrichttp.New(ctx, exporterOptions...)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+
+	var exporter metric.Exporter = inner
+	var guard *otelguard.GuardedExporter
+	if guardConfig := resolveGuardConfig(options.Guard, info.Name, options.Endpoint); guardConfig != nil {
+		guard = otelguard.New(inner, *guardConfig, otelguard.WithLogger(logger))
+		exporter = guard
 	}
 
 	interval := options.ExportInterval
@@ -321,11 +347,48 @@ func newMeterProvider(ctx context.Context, res *resource.Resource, options Metri
 	if runtimeMetrics {
 		readerOptions = append(readerOptions, metric.WithProducer(otelruntime.NewProducer()))
 	}
-	logger.Info("metric exporter configured", zap.Duration("interval", interval))
+	logger.Info("metric exporter configured", zap.Duration("interval", interval), zap.Bool("guarded", guard != nil))
 	return metric.NewMeterProvider(
 		metric.WithResource(res),
 		metric.WithReader(metric.NewPeriodicReader(exporter, readerOptions...)),
-	), nil
+	), guard, nil
+}
+
+// resolveGuardConfig decides whether the metric exporter is guarded. Guarding
+// is the default: the guard is what keeps a broken OTLP endpoint from printing
+// an export error on every collection cycle, so a service that only maps its
+// endpoint is protected without adding code. An explicit Guard replaces the
+// environment-derived config entirely; Config.Disabled (or
+// OTEL_GUARD_DISABLED) opts back out and keeps the raw exporter.
+func resolveGuardConfig(configured *otelguard.Config, service, endpoint string) *otelguard.Config {
+	guardConfig := otelguard.ConfigFromEnv()
+	if configured != nil {
+		guardConfig = *configured
+	}
+	if guardConfig.Disabled {
+		return nil
+	}
+	if guardConfig.Service == "" {
+		guardConfig.Service = service
+	}
+	if guardConfig.Endpoint == "" {
+		guardConfig.Endpoint = endpoint
+	}
+	return &guardConfig
+}
+
+// anyGuardOpen reports whether any guarded exporter is open. It is passed to the
+// global error handler after every signal is wired, so the predicate covers all
+// guards created in this setup.
+func anyGuardOpen(guards []*otelguard.GuardedExporter) func() bool {
+	return func() bool {
+		for _, guard := range guards {
+			if guard.IsOpen() {
+				return true
+			}
+		}
+		return false
+	}
 }
 
 var redisOTelOnce sync.Once
