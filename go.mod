@@ -11,7 +11,7 @@ go 1.26.0
 
 require (
 	buf.build/go/protovalidate v1.3.0
-	connectrpc.com/connect v1.20.0
+	connectrpc.com/connect/v2 v2.0.2
 	github.com/exaring/otelpgx v0.11.1
 	github.com/hashicorp/consul/api v1.34.4
 	github.com/jackc/pgx/v5 v5.10.0

@@ -8,27 +8,29 @@ import (
 	"strings"
 	"testing"
 
-	"connectrpc.com/connect"
+	"connectrpc.com/connect/v2"
+	"connectrpc.com/connect/v2/connectproto"
 	"github.com/lens077/go-connect-kit/errinfo"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
-	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 var errCartEmpty = errinfo.New("CART_EMPTY", "[order] cart is empty")
 
+// invoke 直接调用拦截器包住的 ServerFunc，不起 HTTP 服务：
+// v2 拦截器只依赖 spec 与返回的 error，CallInfo 缺席（info 为 nil）不影响被测逻辑。
 func invoke(t *testing.T, opts []Option, returned error) (*observer.ObservedLogs, *sdkmetric.ManualReader, error) {
 	t.Helper()
 	core, logs := observer.New(zap.DebugLevel)
 	reader := sdkmetric.NewManualReader()
 	opts = append(opts, WithMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))))
 	interceptor := New(zap.New(core), opts...)
-	next := func(context.Context, connect.AnyRequest) (connect.AnyResponse, error) { return nil, returned }
-	req := connect.NewRequest(&emptypb.Empty{})
-	_, err := interceptor.WrapUnary(next)(context.Background(), req)
+	next := func(context.Context, connect.Spec, connect.ServerStream) error { return returned }
+	spec := connect.Spec{Procedure: "/rpcobs.test.v1.CartService/Checkout"}
+	err := interceptor(next)(context.Background(), spec, nil)
 	return logs, reader, err
 }
 
@@ -37,7 +39,7 @@ func invoke(t *testing.T, opts []Option, returned error) (*observer.ObservedLogs
 func TestBusinessExceptionCarriesErrorAndReason(t *testing.T) {
 	wrapped := fmt.Errorf("checkout: %w", errCartEmpty)
 	logs, reader, err := invoke(t, []Option{WithDomain("order-service")},
-		connect.NewError(connect.CodeFailedPrecondition, wrapped))
+		connect.NewError(connect.CodeFailedPrecondition, wrapped.Error()).WithCause(wrapped))
 
 	if !errors.Is(err, errCartEmpty) {
 		t.Fatal("interceptor must pass the original error chain through")
@@ -60,7 +62,7 @@ func TestBusinessExceptionCarriesErrorAndReason(t *testing.T) {
 	}
 	var info *errdetails.ErrorInfo
 	for _, d := range connectErr.Details() {
-		v, valueErr := d.Value()
+		v, valueErr := connectproto.UnmarshalErrorDetail(d)
 		if valueErr != nil {
 			t.Fatal(valueErr)
 		}
@@ -80,8 +82,9 @@ func TestBusinessExceptionCarriesErrorAndReason(t *testing.T) {
 // 抛错点必须是记录 Here 的那一行，而不是拦截器：拦截器的行号无法拿去 blame。
 func TestSystemErrorCarriesOrigin(t *testing.T) {
 	cause, wantLine := errinfo.Here(errors.New("connection reset")), callerLine() // origin 应指向这一行
+	causeErr := fmt.Errorf("query order: %w", cause)
 	logs, reader, _ := invoke(t, nil,
-		connect.NewError(connect.CodeUnknown, fmt.Errorf("query order: %w", cause)))
+		connect.NewError(connect.CodeUnknown, causeErr.Error()).WithCause(causeErr))
 
 	entries := logs.FilterMessage("rpc system error").All()
 	if len(entries) != 1 {
