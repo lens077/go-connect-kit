@@ -26,6 +26,20 @@ type Options struct {
 	FrameworkLogLevel   string
 	FrameworkErrorLevel string
 	StacktraceLevel     string
+
+	// RedactEnabled controls field/message redaction on both the stdout and
+	// the OTel sink. nil means enabled (the secure default).
+	RedactEnabled *bool
+	// Redact carries the replacement mask and extra sensitive key patterns.
+	// Its zero value uses the built-in rules.
+	Redact RedactOptions
+	// LogRateLimit enables same-message rate limiting when non-nil. It is
+	// opt-in because, unlike redaction, it deliberately drops log entries.
+	LogRateLimit *RateLimitOptions
+}
+
+func (options Options) redactionEnabled() bool {
+	return options.RedactEnabled == nil || *options.RedactEnabled
 }
 
 // Projector maps a caller-owned configuration message into logging Options.
@@ -132,5 +146,15 @@ func newLogger(options Options, info meta.AppInfo) (*zap.Logger, zap.AtomicLevel
 	if options.StacktraceLevel != "" {
 		zapOptions = append(zapOptions, zap.AddStacktrace(parseLevel(options.StacktraceLevel)))
 	}
-	return zap.New(teeCores(stdoutCore, otelCore, level), zapOptions...), level
+
+	// Order matters: redaction is outermost so the rate limiter only ever sees
+	// already-scrubbed messages, never raw secrets.
+	core := teeCores(stdoutCore, otelCore, level)
+	if options.LogRateLimit != nil {
+		core = newRateLimitCore(core, *options.LogRateLimit)
+	}
+	if options.redactionEnabled() {
+		core = newRedactCore(core, options.Redact)
+	}
+	return zap.New(core, zapOptions...), level
 }
