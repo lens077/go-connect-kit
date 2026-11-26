@@ -20,8 +20,12 @@ const healthPath = "/healthz"
 // kit's template for the convention). Health probes on healthPath are excluded
 // from both spans and metrics.
 //
-// The returned handler must be installed inside h2c.NewHandler, so that OTel
-// sees the original HTTP request before the protocol upgrade.
+// Install it directly on http.Server.Handler when the server relies on
+// http.Protocols{UnencryptedHTTP2} (Go 1.24+, the preferred setup: the
+// deprecated x/net/http2/h2c wrapper is not needed for prior-knowledge h2c).
+// If a caller still wraps with h2c.NewHandler — it is the only way to honour an
+// HTTP/1.1 "Upgrade: h2c" request — keep this handler inside that wrapper so
+// OTel sees the original HTTP request before the protocol upgrade.
 func InstrumentHTTP(handler http.Handler, operation string) http.Handler {
 	return otelhttp.NewHandler(handler, operation,
 		otelhttp.WithFilter(func(req *http.Request) bool {

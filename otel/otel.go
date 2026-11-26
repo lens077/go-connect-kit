@@ -34,6 +34,21 @@ import (
 const (
 	defaultSampleRatio    = 1.0
 	defaultMetricInterval = 30 * time.Second
+
+	// attributeValueDepthLimit pins the depth cap for span and log attribute
+	// values. otel v1.47 introduced the limit with a default of 64; writing it
+	// down keeps our exported attribute shape identical even if upstream changes
+	// that default later. It costs nothing here: values are flat except the
+	// semconv scratch maps.
+	attributeValueDepthLimit = 64
+	// metricMaxExportBatchSize bounds a single OTLP metric export. The SDK default
+	// is unlimited, so a cardinality spike can turn one collection cycle into a
+	// multi-megabyte request; capping it trades extra requests for bounded memory.
+	metricMaxExportBatchSize = 10000
+	// otlpMaxResponseSize restates the exporter default (4 MiB). The limit cannot
+	// be disabled upstream, so an explicit number is what stops a future default
+	// change from silently loosening it.
+	otlpMaxResponseSize = 4 << 20
 )
 
 // TLSOptions is the provider-neutral TLS configuration shared by OTLP signals.
@@ -295,6 +310,7 @@ func newTracerProvider(ctx context.Context, res *resource.Resource, options Trac
 	exporterOptions := []otlptracehttp.Option{
 		otlptracehttp.WithEndpoint(options.Endpoint),
 		otlptracehttp.WithCompression(otlptracehttp.GzipCompression),
+		otlptracehttp.WithMaxResponseSize(otlpMaxResponseSize),
 	}
 	if tlsConfig := tlsClientConfig(options.TLS, logger); tlsConfig != nil {
 		exporterOptions = append(exporterOptions, otlptracehttp.WithTLSClientConfig(tlsConfig))
@@ -312,6 +328,7 @@ func newTracerProvider(ctx context.Context, res *resource.Resource, options Trac
 	return trace.NewTracerProvider(
 		trace.WithSampler(trace.ParentBased(trace.TraceIDRatioBased(ratio))),
 		trace.WithResource(res),
+		trace.WithAttributeValueDepthLimit(attributeValueDepthLimit),
 		trace.WithSpanProcessor(trace.NewBatchSpanProcessor(exporter)),
 	), nil
 }
@@ -320,6 +337,7 @@ func newMeterProvider(ctx context.Context, res *resource.Resource, info meta.App
 	exporterOptions := []otlpmetrichttp.Option{
 		otlpmetrichttp.WithEndpoint(options.Endpoint),
 		otlpmetrichttp.WithCompression(otlpmetrichttp.GzipCompression),
+		otlpmetrichttp.WithMaxResponseSize(otlpMaxResponseSize),
 	}
 	if tlsConfig := tlsClientConfig(options.TLS, logger); tlsConfig != nil {
 		exporterOptions = append(exporterOptions, otlpmetrichttp.WithTLSClientConfig(tlsConfig))
@@ -343,7 +361,10 @@ func newMeterProvider(ctx context.Context, res *resource.Resource, info meta.App
 	if interval <= 0 {
 		interval = defaultMetricInterval
 	}
-	readerOptions := []metric.PeriodicReaderOption{metric.WithInterval(interval)}
+	readerOptions := []metric.PeriodicReaderOption{
+		metric.WithInterval(interval),
+		metric.WithMaxExportBatchSize(metricMaxExportBatchSize),
+	}
 	if runtimeMetrics {
 		readerOptions = append(readerOptions, metric.WithProducer(otelruntime.NewProducer()))
 	}
@@ -407,6 +428,7 @@ func newLoggerProvider(ctx context.Context, res *resource.Resource, options Logg
 	exporterOptions := []otlploghttp.Option{
 		otlploghttp.WithEndpoint(options.Endpoint),
 		otlploghttp.WithCompression(otlploghttp.GzipCompression),
+		otlploghttp.WithMaxResponseSize(otlpMaxResponseSize),
 	}
 	if tlsConfig := tlsClientConfig(options.TLS, logger); tlsConfig != nil {
 		exporterOptions = append(exporterOptions, otlploghttp.WithTLSClientConfig(tlsConfig))
@@ -420,6 +442,7 @@ func newLoggerProvider(ctx context.Context, res *resource.Resource, options Logg
 	}
 	return sdklog.NewLoggerProvider(
 		sdklog.WithResource(res),
+		sdklog.WithAttributeValueDepthLimit(attributeValueDepthLimit),
 		sdklog.WithProcessor(sdklog.NewBatchProcessor(exporter)),
 	), nil
 }
